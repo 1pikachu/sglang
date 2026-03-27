@@ -118,6 +118,16 @@ runs:
                 console.log(`[rate-limit] 304 Not Modified | this session: ${apiCalls} paid, ${cachedCalls} free`);
                 return { jobs: lastJobs, cached: true };
               }
+
+              // Dump full error details for debugging rate limit issues
+              console.log(`[error] status=${err.status}, message=${err.message}`);
+              if (err.response) {
+                const h = err.response.headers;
+                console.log(`[error-headers] x-ratelimit-limit=${h['x-ratelimit-limit']}, x-ratelimit-remaining=${h['x-ratelimit-remaining']}, x-ratelimit-used=${h['x-ratelimit-used']}, x-ratelimit-resource=${h['x-ratelimit-resource']}, x-ratelimit-reset=${h['x-ratelimit-reset']}`);
+                console.log(`[error-headers] retry-after=${h['retry-after']}, x-github-request-id=${h['x-github-request-id']}`);
+                console.log(`[error-body] ${JSON.stringify(err.response.data)}`);
+              }
+
               throw err;
             }
           }

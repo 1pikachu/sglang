@@ -215,9 +215,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation()
 
-        # Subprocess liveness watchdog — set by Engine or http_server after construction
-        self._subprocess_watchdog = None
-
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
 
@@ -339,6 +336,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
+
+        # Subprocess liveness watchdog — set by Engine or http_server after construction
+        self._subprocess_watchdog = None
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
@@ -500,7 +500,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
-        self._req_stats_init(obj, request)
+        time_stats = self._init_req_timestats(obj, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
@@ -517,13 +517,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
-                state = self.rid_to_state[obj.rid]
-                self._send_one_request(tokenized_obj)
+                tokenized_obj = await self._tokenize_one_request(obj, time_stats)
+                state = self._send_one_request(obj, tokenized_obj, time_stats)
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
-                async for response in self._handle_batch_request(obj, request):
+                async for response in self._handle_batch_request(
+                    obj, request, time_stats
+                ):
                     yield response
 
     def _detect_input_format(
@@ -667,6 +668,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        time_stats: Optional["APIServerReqTimeStats"] = None,
     ):
         """Tokenize one request."""
         # Tokenize
@@ -773,12 +775,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
         """Validate that request IDs are not already in flight."""
-        if obj.rid is None:
-            return
-        rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
-        conflicts = set(rids) & self.rid_to_state.keys()
-        if conflicts:
-            raise ValueError(f"Duplicate request IDs detected: {list(conflicts)}")
+        if isinstance(obj.rid, list):
+            conflicts = set(obj.rid) & self.rid_to_state.keys()
+            if conflicts:
+                raise ValueError(
+                    f"Duplicate request IDs detected: {list(conflicts)}"
+                )
+        else:
+            if obj.rid in self.rid_to_state:
+                raise ValueError(
+                    f"Duplicate request IDs detected: [{obj.rid!r}]"
+                )
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -994,8 +1001,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
-        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
-        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        if time_stats is not None:
+            tokenized_obj.time_stats = time_stats
+            time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
 
@@ -1091,20 +1099,43 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def _send_one_request(
         self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
-    ):
-        tokenized_obj.time_stats.set_api_server_dispatch_time()
+        time_stats: Optional["APIServerReqTimeStats"] = None,
+    ) -> "ReqState":
+        if tokenized_obj.time_stats is None:
+            if time_stats is None:
+                time_stats = APIServerReqTimeStats(
+                    disagg_mode=self.disaggregation_mode
+                )
+            time_stats.set_created_time(obj.received_time)
+            tokenized_obj.time_stats = time_stats
+        else:
+            time_stats = tokenized_obj.time_stats
+        time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
-        tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+        time_stats.set_api_server_dispatch_finish_time()
+        state = ReqState([], False, asyncio.Event(), obj, time_stats)
+        self.rid_to_state[obj.rid] = state
+        return state
 
     def _send_batch_request(
         self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenized_objs: List[
             Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
         ],
+        time_stats: Optional["APIServerReqTimeStats"] = None,
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        # Ensure each tokenized object has its own time_stats
+        for i, tokenized_obj in enumerate(tokenized_objs):
+            if tokenized_obj.time_stats is None:
+                ts = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+                ts.set_created_time(obj[i].received_time)
+                tokenized_obj.time_stats = ts
+
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
@@ -1113,6 +1144,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         self.send_to_scheduler.send_pyobj(batch_req)
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+
+        # Create states for each individual request in the batch
+        for i, tokenized_obj in enumerate(tokenized_objs):
+            tmp_obj = obj[i]
+            state = ReqState(
+                [], False, asyncio.Event(), tmp_obj, tokenized_obj.time_stats
+            )
+            self.rid_to_state[tmp_obj.rid] = state
 
     async def _wait_one_response(
         self,
@@ -1262,6 +1301,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        time_stats: Optional["APIServerReqTimeStats"] = None,
     ):
         batch_size = obj.batch_size
 
@@ -1269,15 +1309,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-                self._send_batch_request(tokenized_objs)
+                tokenized_objs = await self._batch_tokenize_and_process(
+                    batch_size, obj
+                )
+                self._send_batch_request(obj, tokenized_objs, time_stats)
 
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
-                    state = self.rid_to_state[tmp_obj.rid]
-                    state.obj = tmp_obj
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj, self.rid_to_state[tmp_obj.rid], request
+                        )
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -1289,9 +1333,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     for i in range(batch_size):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                        state = self.rid_to_state[tmp_obj.rid]
-                        state.obj = tmp_obj
-                        self._send_one_request(tokenized_obj)
+                        state = self._send_one_request(
+                            tmp_obj, tokenized_obj, time_stats
+                        )
                         generators.append(
                             self._wait_one_response(tmp_obj, state, request)
                         )
@@ -1319,10 +1363,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                self._req_stats_init(tmp_obj)
-                state = self.rid_to_state[tmp_obj.rid]
-                tokenized_obj.time_stats = state.time_stats
-                self._send_one_request(tokenized_obj)
+                state = self._send_one_request(tmp_obj, tokenized_obj, time_stats)
                 await self._wait_one_response(tmp_obj, state, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
@@ -1331,15 +1372,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._req_stats_init(tmp_obj)
-                    state = self.rid_to_state[tmp_obj.rid]
-                    tokenized_obj.time_stats = state.time_stats
-                    self._send_one_request(tokenized_obj)
+                    state = self._send_one_request(
+                        tmp_obj, tokenized_obj, time_stats
+                    )
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
-
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -2296,58 +2333,37 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
-    def _req_stats_init(
+    def _init_req_timestats(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
-    ):
+    ) -> "APIServerReqTimeStats":
+        """Initialize time stats for a single request. Returns the time_stats object."""
         calibrate_time_diff()
         created_time = obj.received_time
 
-        external_trace_header = None
+        time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+
         if self.server_args.enable_trace:
             if obj.external_trace_header:
-                # When the request comes from the rust grpc server or Engine there isn't a
-                # real request object but we still need to propagate the trace context from
-                # the trace context that is explicitly passed in
                 external_trace_header = obj.external_trace_header
             elif request:
                 external_trace_header = extract_trace_headers(request.headers)
                 obj.external_trace_header = external_trace_header
+            else:
+                external_trace_header = None
 
-        if not hasattr(obj, "is_single") or obj.is_single:
-            time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
-            state = ReqState([], False, asyncio.Event(), obj, time_stats)
-            self.rid_to_state[obj.rid] = state
+            bootstrap_room = (
+                obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
+            )
+            time_stats.init_trace_ctx(
+                obj.rid,
+                bootstrap_room,
+                external_trace_header,
+            )
 
-            if self.server_args.enable_trace:
-                bootstrap_room = (
-                    obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
-                )
-                time_stats.init_trace_ctx(
-                    obj.rid,
-                    bootstrap_room,
-                    external_trace_header,
-                )
-            time_stats.set_created_time(created_time)
-        else:
-            for i in range(len(obj.rid)):
-                time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
-                state = ReqState([], False, asyncio.Event(), obj[i], time_stats)
-                self.rid_to_state[obj.rid[i]] = state
-
-                if self.server_args.enable_trace:
-                    bootstrap_room = (
-                        obj.bootstrap_room[i]
-                        if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
-                        else None
-                    )
-                    time_stats.init_trace_ctx(
-                        obj.rid[i],
-                        bootstrap_room,
-                        external_trace_header,
-                    )
-                time_stats.set_created_time(created_time)
+        time_stats.set_created_time(created_time)
+        return time_stats
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

@@ -182,6 +182,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
     ) -> argparse.Namespace:
         if args is None:
             args = sys.argv[1:]
+
         if any(arg.startswith("--config") for arg in args):
             args = self._pull_args_from_config(args)
 
@@ -204,6 +205,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
 
         namespace = super().parse_args(processed_args, namespace)
 
+        # Track which arguments were explicitly provided
         namespace._provided = set()
 
         i = 0

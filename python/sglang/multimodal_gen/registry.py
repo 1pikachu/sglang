@@ -75,6 +75,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
 from sglang.multimodal_gen.configs.sample.flux import (
+    Flux2SamplingParams,
     Flux2KleinSamplingParams,
     FluxSamplingParams,
 )
@@ -721,7 +722,7 @@ def _register_configs():
         ],
     )
     register_configs(
-        sampling_param_cls=FluxSamplingParams,
+        sampling_param_cls=Flux2SamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",

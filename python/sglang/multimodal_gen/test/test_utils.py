@@ -4,13 +4,16 @@ import io
 import json
 import os
 import socket
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import cv2
+import httpx
 import numpy as np
 import requests
 from PIL import Image
@@ -25,7 +28,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 
-# --- Consistency testing: GT from sgl-test-files or local SGLANG_CONSISTENCY_GT_DIR ---
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt"
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
@@ -34,6 +36,70 @@ CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 DEFAULT_CLIP_THRESHOLD_IMAGE = 0.92
 DEFAULT_CLIP_THRESHOLD_VIDEO = 0.90
 _clip_model_cache: dict[str, Any] = {}
+
+# ---------------------------------------------------------------------------
+# Common model IDs for diffusion tests
+#
+# Centralised here so every test file references the same constants instead
+# of scattering hard-coded strings. When adding a new model that will be
+# reused across tests, define it here.
+# ---------------------------------------------------------------------------
+
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
+
+# Qwen image generation models
+DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image"
+DEFAULT_QWEN_IMAGE_2512_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-2512"
+DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit"
+DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2509"
+DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2511"
+DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Layered"
+
+# FLUX image generation models
+DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.1-dev"
+DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.2-dev"
+DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST = (
+    "black-forest-labs/FLUX.2-klein-base-4B"
+)
+
+# Wan video generation models
+DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+)
+DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+)
+DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+
+# MOVA video generation models
+DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
+
+
+def print_value_formatted(description: str, value: int | float | str):
+    """Helper function to print a metric value formatted."""
+    if isinstance(value, int):
+        if value >= 1e6:
+            value_str = f"{value / 1e6:<30.2f}M"
+        elif value >= 1e3:
+            value_str = f"{value / 1e3:<30.2f}K"
+        else:
+            value_str = f"{value:<30}"
+    elif isinstance(value, float):
+        value_str = f"{value:<30.2f}"
+    else:
+        value_str = f"{value:<30}"
+
+    print(f"{description:<45} {value_str}")
+
+
+def print_divider(length: int, char: str = "-"):
+    """Helper function to print a divider line."""
+    print(char * length)
 
 
 def is_image_url(image_path: str | Path | None) -> bool:
@@ -74,6 +140,107 @@ def get_dynamic_server_port() -> int:
         base_port = 20000 + first_device_id * 1000
 
     return base_port + 1000
+
+
+def find_free_port(host: str = "127.0.0.1") -> int:
+    """Bind to port 0 and let the OS assign an available port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def wait_for_server_health(
+    base_url: str,
+    path: str = "/health",
+    timeout: float = 180.0,
+    interval: float = 1.0,
+) -> None:
+    """Poll ``GET <base_url><path>`` until it returns HTTP 200."""
+    deadline = time.time() + timeout
+    last_err: httpx.RequestError | None = None
+    last_status: int | None = None
+    while time.time() < deadline:
+        try:
+            r = httpx.get(urljoin(base_url, path), timeout=5.0)
+            last_status = r.status_code
+            if r.status_code == 200:
+                return
+        except httpx.RequestError as e:
+            last_err = e
+        time.sleep(interval)
+    raise TimeoutError(
+        f"Server at {urljoin(base_url, path)} not healthy after {timeout}s. "
+        f"{last_status=} {last_err=}"
+    )
+
+
+def post_json(
+    base_url: str,
+    path: str,
+    payload: dict,
+    timeout: float = 300.0,
+) -> httpx.Response:
+    """POST JSON to ``<base_url><path>`` and return the response."""
+    return httpx.post(urljoin(base_url, path), json=payload, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# GPU memory helpers (nvidia-smi)
+# ---------------------------------------------------------------------------
+
+
+def query_gpu_mem_used_mib(gpu_index: int = 0, required: bool = False) -> int | None:
+    """Return GPU memory usage in MiB via ``nvidia-smi``, or *None* on failure.
+
+    When *required* is ``True`` the function raises instead of returning ``None``.
+    """
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--id={gpu_index}",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        ).strip()
+        return int(out.splitlines()[0].strip())
+    except Exception as e:
+        logger.warning(f"nvidia-smi memory query failed: {type(e).__name__}: {e}")
+        assert not required, (
+            "nvidia-smi memory query is unavailable; "
+            "cannot enforce GPU memory assertions."
+        )
+        return None
+
+
+def require_gpu_mem_query(gpu_index: int = 0) -> int:
+    """Same as :func:`query_gpu_mem_used_mib` but asserts availability.
+
+    Raises ``AssertionError`` when ``nvidia-smi`` is unavailable instead of
+    returning ``None``, so callers can rely on a valid ``int`` result.
+    """
+    mem = query_gpu_mem_used_mib(gpu_index, required=True)
+    assert mem is not None
+    return mem
+
+
+def assert_gpu_mem_changed(
+    label: str,
+    before_mib: int,
+    after_mib: int,
+    min_delta_mib: int,
+) -> None:
+    """Assert that GPU memory changed by at least *min_delta_mib* MiB."""
+    delta = abs(after_mib - before_mib)
+    logger.debug(
+        f"[MEM] {label}: before={before_mib} MiB  after={after_mib} MiB  |delta|={delta} MiB"
+    )
+    assert delta >= min_delta_mib, (
+        f"GPU memory change too small for '{label}': "
+        f"|after-before|={delta} MiB < {min_delta_mib} MiB "
+        f"(before={before_mib} MiB, after={after_mib} MiB)"
+    )
 
 
 def is_mp4(data: bytes) -> bool:
@@ -351,6 +518,22 @@ def get_video_dimensions(file_path: str) -> tuple[int, int]:
         cap.release()
 
 
+def get_video_frame_count(file_path: str) -> int:
+    """Return the number of frames in a video file using OpenCV."""
+    cap = cv2.VideoCapture(file_path)
+    try:
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if count > 0:
+            return count
+        # Fallback: count frames manually
+        n = 0
+        while cap.read()[0]:
+            n += 1
+        return n
+    finally:
+        cap.release()
+
+
 def validate_video_file(
     file_path: str,
     expected_filename: str,
@@ -390,9 +573,6 @@ def validate_video_file(
         ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
 
 
-# --- Consistency testing (GT from sgl-test-files, embeddings computed on the fly) ---
-
-
 def _load_threshold_json() -> dict[str, Any]:
     """Load consistency_threshold.json; returns {} if missing."""
     if not CONSISTENCY_THRESHOLD_JSON_PATH.exists():
@@ -405,11 +585,7 @@ def get_clip_threshold(
     case: DiffusionTestCase,
     metadata: dict[str, Any] | None = None,
 ) -> float:
-    """
-    Get CLIP similarity threshold for a consistency test case.
-    Uses consistency_threshold.json: default_clip_threshold_image/video and
-    optional per-case override in cases.<case_id>.clip_threshold.
-    """
+    """Get CLIP similarity threshold for a consistency test case."""
     if metadata is None:
         metadata = _load_threshold_json()
     case_meta = metadata.get("cases", {}).get(case.id, {})
@@ -435,26 +611,17 @@ class ConsistencyResult:
 
 
 def get_clip_model() -> tuple[Any, Any]:
-    """
-    Get CLIP model and processor (lazy loading with singleton pattern).
-
-    Returns:
-        Tuple of (model, processor)
-
-    Raises:
-        ImportError: If transformers is not installed
-    """
+    """Get CLIP model and processor."""
     global _clip_model_cache
 
     if "model" not in _clip_model_cache:
         try:
             import torch
             from transformers import CLIPModel, CLIPProcessor
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "transformers and torch are required for CLIP consistency check. "
-                "Install with: pip install transformers torch"
-            )
+                "transformers and torch are required for CLIP consistency check."
+            ) from exc
 
         logger.info(f"Loading CLIP model: {CLIP_MODEL_NAME}")
         processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
@@ -473,22 +640,11 @@ def get_clip_model() -> tuple[Any, Any]:
 
 
 def compute_clip_embedding(image: np.ndarray) -> np.ndarray:
-    """
-    Compute CLIP embedding for a single image.
-
-    Args:
-        image: numpy array (H, W, C) in RGB format
-
-    Returns:
-        768-dimensional numpy array (L2 normalized)
-    """
+    """Compute a normalized CLIP image embedding."""
     try:
         import torch
-    except ImportError:
-        raise ImportError(
-            "torch is required for CLIP consistency check. "
-            "Install with: pip install torch"
-        )
+    except ImportError as exc:
+        raise ImportError("torch is required for CLIP consistency check.") from exc
 
     model, processor = get_clip_model()
     device = _clip_model_cache["device"]
@@ -505,11 +661,8 @@ def compute_clip_embedding(image: np.ndarray) -> np.ndarray:
 
 
 def compute_clip_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
-    """
-    Compute cosine similarity between two CLIP embeddings.
-    """
-    similarity = np.dot(emb1, emb2)
-    return float(similarity)
+    """Compute cosine similarity between two CLIP embeddings."""
+    return float(np.dot(emb1, emb2))
 
 
 def output_format_to_ext(output_format: str | None) -> str:
@@ -542,12 +695,7 @@ def _consistency_gt_filenames(
 def get_consistency_gt_candidates(
     case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
 ) -> list[str]:
-    """Return list of GT filenames to try when using SGLANG_CONSISTENCY_GT_DIR.
-
-    For image: [base.png, base.jpg, base.webp] in preferred-first order so that
-    GT can be stored as .png, .jpg, or .webp. For video: the 3 frame filenames
-    (no extension fallback).
-    """
+    """Return candidate GT filenames for local consistency data."""
     n = num_gpus
     if is_video:
         return [
@@ -562,7 +710,7 @@ def get_consistency_gt_candidates(
 
 
 def _get_consistency_gt_dir() -> Path | None:
-    """If SGLANG_CONSISTENCY_GT_DIR is set, return that Path; else None (use remote)."""
+    """Return the local GT directory when configured."""
     d = os.environ.get("SGLANG_CONSISTENCY_GT_DIR")
     if not d:
         return None
@@ -575,11 +723,7 @@ def load_gt_embeddings(
     is_video: bool = False,
     output_format: str | None = None,
 ) -> list[np.ndarray]:
-    """
-    Load ground truth by downloading image(s) from sgl-test-files or reading from
-    SGLANG_CONSISTENCY_GT_DIR, then compute CLIP embeddings.
-    Format (png/jpg/webp) follows case output_format; PIL converts to RGB for CLIP.
-    """
+    """Load GT images and convert them into CLIP embeddings."""
     filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
     embeddings = []
 
@@ -594,22 +738,20 @@ def load_gt_embeddings(
                 if not path.exists():
                     raise FileNotFoundError(f"GT image not found: {path}")
                 arr = np.array(Image.open(path).convert("RGB"))
-                emb = compute_clip_embedding(arr)
-                embeddings.append(emb)
+                embeddings.append(compute_clip_embedding(arr))
         else:
             path = None
             for fn in candidates:
-                p = gt_dir / fn
-                if p.exists():
-                    path = p
+                candidate = gt_dir / fn
+                if candidate.exists():
+                    path = candidate
                     break
             if path is None:
                 raise FileNotFoundError(
                     f"GT image not found in {gt_dir}. Tried: {', '.join(candidates)}"
                 )
             arr = np.array(Image.open(path).convert("RGB"))
-            emb = compute_clip_embedding(arr)
-            embeddings.append(emb)
+            embeddings.append(compute_clip_embedding(arr))
         logger.info(
             f"Loaded {len(embeddings)} GT embeddings for {case_id} from {gt_dir}"
         )
@@ -619,11 +761,8 @@ def load_gt_embeddings(
             resp = requests.get(url, timeout=30)
             if resp.status_code != 200:
                 raise FileNotFoundError(f"GT image not found: {url}")
-
             arr = np.array(Image.open(io.BytesIO(resp.content)).convert("RGB"))
-            emb = compute_clip_embedding(arr)
-            embeddings.append(emb)
-
+            embeddings.append(compute_clip_embedding(arr))
         logger.info(
             f"Loaded {len(embeddings)} GT embeddings for {case_id} from sgl-test-files"
         )
@@ -636,7 +775,7 @@ def gt_exists(
     is_video: bool = False,
     output_format: str | None = None,
 ) -> bool:
-    """Check if GT image(s) exist (sgl-test-files or SGLANG_CONSISTENCY_GT_DIR)."""
+    """Check whether GT image(s) exist."""
     gt_dir = _get_consistency_gt_dir()
     if gt_dir is not None:
         candidates = get_consistency_gt_candidates(
@@ -720,9 +859,7 @@ def compare_with_gt(
     threshold: float,
     case_id: str,
 ) -> ConsistencyResult:
-    """
-    Compare output frames with ground truth embeddings using CLIP similarity.
-    """
+    """Compare output frames with GT embeddings using CLIP similarity."""
     if len(output_frames) != len(gt_embeddings):
         raise ValueError(
             f"Frame count mismatch: output={len(output_frames)}, gt={len(gt_embeddings)}"
@@ -757,30 +894,16 @@ def compare_with_gt(
     )
 
     status = "PASSED" if passed else "FAILED"
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"[CLIP Consistency] {case_id}: {status}")
     print(f"  Threshold: {threshold}")
     print(f"  Min similarity: {min_similarity:.4f}")
-    print(f"  Frame details:")
+    print("  Frame details:")
     for detail in frame_details:
-        frame_status = "✓" if detail["passed"] else "✗"
+        frame_status = "PASS" if detail["passed"] else "FAIL"
         print(
             f"    Frame {detail['frame_index']}: similarity={detail['similarity']:.4f} {frame_status}"
         )
-    print(f"{'='*60}\n")
-
-    if passed:
-        logger.info(
-            f"[Consistency] {case_id}: PASSED (min_similarity={min_similarity:.4f}, threshold={threshold})"
-        )
-    else:
-        logger.error(
-            f"[Consistency] {case_id}: FAILED (min_similarity={min_similarity:.4f}, threshold={threshold})"
-        )
-        for detail in frame_details:
-            if not detail["passed"]:
-                logger.error(
-                    f"  Frame {detail['frame_index']}: similarity={detail['similarity']:.4f} < {threshold}"
-                )
+    print(f"{'=' * 60}\n")
 
     return result

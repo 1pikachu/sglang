@@ -19,14 +19,12 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
+from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
     ServerContext,
     ServerManager,
-    WarmupRunner,
-    download_image_from_url,
     get_generate_fn,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -45,7 +43,6 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
-    is_image_url,
     load_gt_embeddings,
     wait_for_req_perf_record,
 )
@@ -91,18 +88,29 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.dit_layerwise_offload:
         extra_args += f" --dit-layerwise-offload true"
 
+    if server_args.dit_offload_prefetch_size:
+        extra_args += (
+            f" --dit-offload-prefetch-size {server_args.dit_offload_prefetch_size}"
+        )
+
     if server_args.text_encoder_cpu_offload:
         extra_args += f" --text-encoder-cpu-offload"
 
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
 
+    if server_args.cfg_parallel:
+        extra_args += " --enable-cfg-parallel"
+
     # LoRA support
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
     if server_args.enable_warmup:
-        extra_args += f" --enable-warmup"
+        extra_args += " --warmup"
+
+    for arg in server_args.extras:
+        extra_args += f" {arg}"
 
     # Build custom environment variables
     env_vars = {}
@@ -117,7 +125,20 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         extra_args=extra_args,
         env_vars=env_vars,
     )
-    ctx = manager.start()
+    try:
+        ctx = manager.start()
+    except (RuntimeError, TimeoutError) as exc:
+        # Auto-skip when the installed diffusers version lacks the required
+        # pipeline class.  This avoids hard failures when a model needs a
+        # newer diffusers release than what is currently installed in CI.
+        msg = str(exc)
+        if "not found in diffusers" in msg or "has no attribute" in msg:
+            pytest.skip(
+                f"Skipping {case.id}: required diffusers pipeline class "
+                f"is not available in the installed version. "
+                f"Upgrade diffusers to enable this test."
+            )
+        raise
 
     try:
         # Reconstruct output size for OpenAI API
@@ -125,41 +146,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         output_size = os.environ.get(
             "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
         )
-        warmup = WarmupRunner(
-            port=ctx.port,
-            model=server_args.model_path,
-            prompt=sampling_params.prompt or "A colorful raccoon icon",
-            output_size=output_size,
-            output_format=sampling_params.output_format,
-        )
-        if server_args.warmup > 0:
-            if sampling_params.image_path and case.sampling_params.prompt:
-                # Handle URL or local path
-                image_path_list = sampling_params.image_path
-                if not isinstance(image_path_list, list):
-                    image_path_list = [image_path_list]
-
-                new_image_path_list = []
-                for image_path in image_path_list:
-                    if is_image_url(image_path):
-                        new_image_path_list.append(
-                            download_image_from_url(str(image_path))
-                        )
-                    else:
-                        path_obj = Path(image_path)
-                        if not path_obj.exists():
-                            pytest.skip(f"{case.id}: file missing: {image_path}")
-                        new_image_path_list.append(path_obj)
-
-                image_path_list = new_image_path_list
-
-                warmup.run_edit_warmups(
-                    count=server_args.warmup,
-                    edit_prompt=sampling_params.prompt,
-                    image_path=image_path_list,
-                )
-            else:
-                warmup.run_text_warmups(server_args.warmup)
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
         ctx.cleanup()
@@ -180,6 +166,7 @@ class DiffusionServerBase:
 
     _perf_results: list[dict[str, Any]] = []
     _improved_baselines: list[dict[str, Any]] = []
+    _pytest_config = None  # Store pytest config for stash access
 
     @classmethod
     def setup_class(cls):
@@ -188,9 +175,21 @@ class DiffusionServerBase:
 
     @classmethod
     def teardown_class(cls):
-        for result in cls._perf_results:
-            result["class_name"] = cls.__name__
-            _GLOBAL_PERF_RESULTS.append(result)
+        print(
+            f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
+        )
+        if cls._pytest_config:
+            # Add results to pytest stash (shared across all import contexts)
+            for result in cls._perf_results:
+                result["class_name"] = cls.__name__
+            conftest.add_perf_results(cls._pytest_config, cls._perf_results)
+            print(
+                f"[DEBUG teardown_class] Added {len(cls._perf_results)} results to stash"
+            )
+        else:
+            print(
+                "[DEBUG teardown_class] No pytest_config available, skipping stash update"
+            )
 
         if cls._improved_baselines:
             import json
@@ -205,6 +204,11 @@ Consider updating perf_baselines.json with the snippets below:
                     f'\n"{item["id"]}": {json.dumps(item["baseline"], indent=4)},\n'
                 )
             print(output)
+
+    @pytest.fixture(autouse=True)
+    def _capture_pytest_config(self, request):
+        """Capture pytest config for use in teardown_class."""
+        self.__class__._pytest_config = request.config
 
     def _client(self, ctx: ServerContext) -> OpenAI:
         """Get OpenAI client for the server."""
@@ -275,20 +279,24 @@ Consider updating perf_baselines.json with the snippets below:
 
         summary = validator.collect_metrics(perf_record)
 
-        if is_baseline_generation_mode or missing_scenario:
-            self._dump_baseline_for_testcase(case, summary, missing_scenario)
-            if missing_scenario:
-                pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
-            return
+        if case.run_perf_check:
+            if is_baseline_generation_mode or missing_scenario:
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                if missing_scenario:
+                    pytest.fail(
+                        f"Testcase '{case.id}' not found in perf_baselines.json"
+                    )
+                return
 
-        self._check_for_improvement(case, summary, scenario)
+            self._check_for_improvement(case, summary, scenario)
 
-        try:
-            validator.validate(perf_record, case.sampling_params.num_frames)
-        except AssertionError as e:
-            logger.error(f"Performance validation failed for {case.id}:\n{e}")
-            self._dump_baseline_for_testcase(case, summary, missing_scenario)
-            raise
+            # only run performance validation if run_perf_check is True
+            try:
+                validator.validate(perf_record, case.sampling_params.num_frames)
+            except AssertionError as e:
+                logger.error(f"Performance validation failed for {case.id}:\n{e}")
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                raise
 
         result = {
             "test_name": case.id,
@@ -311,6 +319,9 @@ Consider updating perf_baselines.json with the snippets below:
             )
 
         self.__class__._perf_results.append(result)
+        print(
+            f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
+        )
 
     def _check_for_improvement(
         self,
@@ -434,30 +445,13 @@ Consider updating perf_baselines.json with the snippets below:
         case: DiffusionTestCase,
         content: bytes,
     ) -> None:
-        """Validate output consistency against ground truth using CLIP similarity.
-
-        Args:
-            case: Test case configuration
-            content: Generated content bytes (image or video)
-
-        Raises:
-            pytest.fail: If consistency check fails (GT exists but doesn't match)
-
-        Note:
-            If GT doesn't exist, the test is skipped (not failed) with a message
-            to run the GT generation workflow after PR is merged.
-
-        Environment Variables:
-            SGLANG_SKIP_CONSISTENCY: Set to "1" to skip consistency checks
-        """
-        # Allow skipping consistency checks for debugging/development
+        """Validate output consistency against ground truth using CLIP similarity."""
         if os.environ.get("SGLANG_SKIP_CONSISTENCY", "0") == "1":
             logger.info(
                 f"[Consistency] Skipping consistency check for {case.id} (SGLANG_SKIP_CONSISTENCY=1)"
             )
             return
 
-        # Skip if content is empty (e.g., video generation timed out)
         if not content:
             logger.warning(
                 f"[Consistency] Skipping consistency check for {case.id}: "
@@ -467,9 +461,8 @@ Consider updating perf_baselines.json with the snippets below:
 
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
-
-        # Check GT exists - if not, fail with instructions to add image(s) to sgl-test-files
         output_format = case.sampling_params.output_format
+
         if not gt_exists(
             case.id, num_gpus, is_video=is_video, output_format=output_format
         ):
@@ -485,7 +478,7 @@ Consider updating perf_baselines.json with the snippets below:
                         case.id, num_gpus, is_video, output_format
                     )
                 )
-            error_msg = f"""
+            logger.error(f"""
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
@@ -498,35 +491,28 @@ For this case, expected file(s): {names}
 Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/consistency_gt/)
 
 (Optional) Per-case override in consistency_threshold.json: "cases": {{ "{case.id}": {{ "clip_threshold": 0.92 }} }}
-"""
-            logger.error(error_msg)
+""")
             pytest.fail(
                 f"GT not found for {case.id}. See logs for instructions to add GT."
             )
 
-        # Load GT embeddings (format matches case; PIL converts to RGB for CLIP)
         gt_embeddings = load_gt_embeddings(
             case.id, num_gpus, is_video=is_video, output_format=output_format
         )
 
-        # Convert output to frames
         if is_video:
             output_frames = extract_key_frames_from_video(content)
         else:
             output_frames = [image_bytes_to_numpy(content)]
 
-        threshold = get_clip_threshold(case)
-
-        # Compare frames with GT embeddings using CLIP similarity
         result = compare_with_gt(
             output_frames=output_frames,
             gt_embeddings=gt_embeddings,
-            threshold=threshold,
+            threshold=get_clip_threshold(case),
             case_id=case.id,
         )
 
         if not result.passed:
-            # Build detailed failure message
             failed_frames = [
                 f"  Frame {d['frame_index']}: similarity={d['similarity']:.4f}"
                 for d in result.frame_details
@@ -748,7 +734,7 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         self,
         ctx: ServerContext,
         case: DiffusionTestCase,
-        generate_fn: Callable[[str, openai.Client], str],
+        generate_fn: Callable[[str, openai.Client], tuple[str, bytes]],
         first_lora_path: str,
         second_lora_path: str,
     ) -> None:
@@ -772,7 +758,8 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         assert (
             resp.status_code == 200
         ), f"set_lora with multiple adapters failed: {resp.text}"
-        assert generate_fn(case.id, client) is not None
+        rid, _ = generate_fn(case.id, client)
+        assert rid is not None
 
         # Test 2: Different strengths
         resp = requests.post(
@@ -787,7 +774,8 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         assert (
             resp.status_code == 200
         ), f"set_lora with different strengths failed: {resp.text}"
-        assert generate_fn(case.id, client) is not None
+        rid, _ = generate_fn(case.id, client)
+        assert rid is not None
 
         # Test 3: Different targets
         requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
@@ -803,14 +791,16 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         assert (
             resp.status_code == 200
         ), f"set_lora with cached adapters failed: {resp.text}"
-        assert generate_fn(case.id, client) is not None
+        rid, _ = generate_fn(case.id, client)
+        assert rid is not None
 
         # Test 4: Switch back to single LoRA
         resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
         assert (
             resp.status_code == 200
         ), f"set_lora back to single adapter failed: {resp.text}"
-        assert generate_fn(case.id, client) is not None
+        rid, _ = generate_fn(case.id, client)
+        assert rid is not None
 
         logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
 
@@ -856,6 +846,7 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         modality_to_valid_task_types = {
             "image": {"T2I", "I2I", "TI2I"},
             "video": {"T2V", "I2V", "TI2V"},
+            "3d": {"I2M"},
         }
         valid_task_types = modality_to_valid_task_types.get(
             case.server_args.modality, set()
@@ -902,6 +893,37 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
 
         logger.info("[Models API] All /v1/models tests passed for %s", case.id)
 
+    def _test_t2v_rejects_input_reference(
+        self, ctx: ServerContext, case: DiffusionTestCase
+    ) -> None:
+        if case.server_args.modality != "video":
+            return
+
+        base_url = f"http://localhost:{ctx.port}"
+        resp = requests.get(f"{base_url}/v1/models")
+        assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
+        data = resp.json().get("data", [])
+        if not data:
+            pytest.fail("/v1/models returned empty model list")
+
+        task_type = data[0].get("task_type")
+        if task_type != "T2V":
+            return
+
+        prompt = case.sampling_params.prompt or "test"
+        payload = {"prompt": prompt, "input_reference": "dummy"}
+        if case.sampling_params.output_size:
+            payload["size"] = case.sampling_params.output_size
+
+        resp = requests.post(f"{base_url}/v1/videos", json=payload)
+        assert (
+            resp.status_code == 400
+        ), f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"
+        detail = resp.json().get("detail", "")
+        assert (
+            "input_reference is not supported" in detail
+        ), f"Unexpected error detail for T2V input_reference: {detail}"
+
     def test_diffusion_generation(
         self,
         case: DiffusionTestCase,
@@ -925,7 +947,7 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
 
         # Dynamic LoRA loading test - tests LayerwiseOffload + set_lora interaction
         # Server starts WITHOUT lora_path, then set_lora is called after startup
-        if case.server_args.dynamic_lora_path and not is_gt_gen_mode:
+        if case.run_lora_dynamic_load_check and not is_gt_gen_mode:
             self._test_dynamic_lora_loading(diffusion_server, case)
 
         generate_fn = get_generate_fn(
@@ -949,30 +971,42 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         # Validation 1: Performance
         self._validate_and_record(case, perf_record)
 
-        # Test /v1/models endpoint for router compatibility
-        self._test_v1_models_endpoint(diffusion_server, case)
+        # Mesh correctness check (Chamfer Distance) for 3D models
+        if case.server_args.custom_validator == "mesh":
+            from sglang.multimodal_gen.test.server.test_server_utils import (
+                MESH_OUTPUT_PATHS,
+                validate_mesh_correctness,
+            )
 
-        # Validation 2: Consistency (reuse the same content)
+            mesh_path = MESH_OUTPUT_PATHS.pop(case.id, None)
+            if mesh_path:
+                validate_mesh_correctness(mesh_path)
+
+        # Test /v1/models endpoint for router compatibility
+        if case.run_models_api_check:
+            self._test_v1_models_endpoint(diffusion_server, case)
+        if case.run_t2v_input_reference_check:
+            self._test_t2v_rejects_input_reference(diffusion_server, case)
+
         self._validate_consistency(case, content)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
-        if case.server_args.lora_path or case.server_args.dynamic_lora_path:
+        if case.run_lora_basic_api_check:
             self._test_lora_api_functionality(diffusion_server, case, generate_fn)
 
-            # Test dynamic LoRA switching (requires a second LoRA adapter)
-            if case.server_args.second_lora_path:
-                self._test_lora_dynamic_switch_e2e(
-                    diffusion_server,
-                    case,
-                    generate_fn,
-                    case.server_args.second_lora_path,
-                )
+        if case.run_lora_dynamic_switch_check:
+            self._test_lora_dynamic_switch_e2e(
+                diffusion_server,
+                case,
+                generate_fn,
+                case.server_args.second_lora_path,
+            )
 
-                # Test multi-LoRA functionality
-                self._test_multi_lora_e2e(
-                    diffusion_server,
-                    case,
-                    generate_fn,
-                    case.server_args.lora_path,
-                    case.server_args.second_lora_path,
-                )
+        if case.run_multi_lora_api_check:
+            self._test_multi_lora_e2e(
+                diffusion_server,
+                case,
+                generate_fn,
+                case.server_args.lora_path,
+                case.server_args.second_lora_path,
+            )

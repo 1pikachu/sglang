@@ -37,7 +37,14 @@ CONSISTENCY_THRESHOLD_JSON_PATH = (
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 DEFAULT_CLIP_THRESHOLD_IMAGE = 0.92
 DEFAULT_CLIP_THRESHOLD_VIDEO = 0.90
+DEFAULT_SSIM_THRESHOLD_IMAGE = 0.95
+DEFAULT_PSNR_THRESHOLD_IMAGE = 28.0
+DEFAULT_MEAN_ABS_DIFF_THRESHOLD_IMAGE = 8.0
+DEFAULT_SSIM_THRESHOLD_VIDEO = 0.92
+DEFAULT_PSNR_THRESHOLD_VIDEO = 24.0
+DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO = 10.0
 _clip_model_cache: dict[str, Any] = {}
+_consistency_gt_cache: dict[str, Any] = {}
 
 # ---------------------------------------------------------------------------
 # Common model IDs for diffusion tests
@@ -583,21 +590,90 @@ def _load_threshold_json() -> dict[str, Any]:
         return json.load(f)
 
 
+@dataclass
+class ConsistencyThresholds:
+    clip_threshold: float
+    ssim_threshold: float
+    psnr_threshold: float
+    mean_abs_diff_threshold: float
+
+
+def get_consistency_thresholds(
+    case_id: str,
+    is_video: bool,
+    metadata: dict[str, Any] | None = None,
+) -> ConsistencyThresholds:
+    """Get all consistency thresholds for a case."""
+    if metadata is None:
+        metadata = _load_threshold_json()
+
+    case_meta = metadata.get("cases", {}).get(case_id, {})
+    suffix = "video" if is_video else "image"
+
+    defaults = {
+        "clip_threshold": metadata.get(
+            f"default_clip_threshold_{suffix}",
+            DEFAULT_CLIP_THRESHOLD_VIDEO if is_video else DEFAULT_CLIP_THRESHOLD_IMAGE,
+        ),
+        "ssim_threshold": metadata.get(
+            f"default_ssim_threshold_{suffix}",
+            DEFAULT_SSIM_THRESHOLD_VIDEO if is_video else DEFAULT_SSIM_THRESHOLD_IMAGE,
+        ),
+        "psnr_threshold": metadata.get(
+            f"default_psnr_threshold_{suffix}",
+            DEFAULT_PSNR_THRESHOLD_VIDEO if is_video else DEFAULT_PSNR_THRESHOLD_IMAGE,
+        ),
+        "mean_abs_diff_threshold": metadata.get(
+            f"default_mean_abs_diff_threshold_{suffix}",
+            (
+                DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO
+                if is_video
+                else DEFAULT_MEAN_ABS_DIFF_THRESHOLD_IMAGE
+            ),
+        ),
+    }
+
+    return ConsistencyThresholds(
+        clip_threshold=float(
+            case_meta.get("clip_threshold", defaults["clip_threshold"])
+        ),
+        ssim_threshold=float(
+            case_meta.get("ssim_threshold", defaults["ssim_threshold"])
+        ),
+        psnr_threshold=float(
+            case_meta.get("psnr_threshold", defaults["psnr_threshold"])
+        ),
+        mean_abs_diff_threshold=float(
+            case_meta.get(
+                "mean_abs_diff_threshold", defaults["mean_abs_diff_threshold"]
+            )
+        ),
+    )
+
+
 def get_clip_threshold(
     case: "DiffusionTestCase",
     metadata: dict[str, Any] | None = None,
 ) -> float:
     """Get CLIP similarity threshold for a consistency test case."""
-    if metadata is None:
-        metadata = _load_threshold_json()
-    case_meta = metadata.get("cases", {}).get(case.id, {})
-    is_video = case.server_args.modality == "video"
-    default = (
-        metadata.get("default_clip_threshold_video", DEFAULT_CLIP_THRESHOLD_VIDEO)
-        if is_video
-        else metadata.get("default_clip_threshold_image", DEFAULT_CLIP_THRESHOLD_IMAGE)
-    )
-    return float(case_meta.get("clip_threshold", default))
+    return get_consistency_thresholds(
+        case_id=case.id,
+        is_video=case.server_args.modality == "video",
+        metadata=metadata,
+    ).clip_threshold
+
+
+@dataclass
+class FrameConsistencyMetrics:
+    frame_index: int
+    clip_similarity: float
+    ssim: float
+    psnr: float
+    mean_abs_diff: float
+    clip_passed: bool
+    ssim_passed: bool
+    psnr_passed: bool
+    mean_abs_diff_passed: bool
 
 
 @dataclass
@@ -609,7 +685,17 @@ class ConsistencyResult:
     similarity_scores: list[float]
     min_similarity: float
     threshold: float
-    frame_details: list[dict[str, Any]]
+    min_ssim: float
+    min_psnr: float
+    max_mean_abs_diff: float
+    thresholds: ConsistencyThresholds
+    frame_metrics: list[FrameConsistencyMetrics]
+
+
+@dataclass
+class LoadedConsistencyGT:
+    images: list[np.ndarray]
+    embeddings: list[np.ndarray]
 
 
 def get_clip_model() -> tuple[Any, Any]:
@@ -671,6 +757,53 @@ def compute_clip_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
     return float(np.dot(emb1, emb2))
 
 
+def _ensure_rgb_uint8_image(image: np.ndarray) -> np.ndarray:
+    """Normalize image input for pixel-wise consistency metrics."""
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"Expected RGB HWC image, got shape={image.shape}")
+    if image.dtype == np.uint8:
+        return image
+    image = np.clip(image, 0, 255)
+    return image.astype(np.uint8)
+
+
+def compute_ssim(image: np.ndarray, gt_image: np.ndarray) -> float:
+    """Compute SSIM between two RGB images."""
+    from skimage.metrics import structural_similarity
+
+    image = _ensure_rgb_uint8_image(image)
+    gt_image = _ensure_rgb_uint8_image(gt_image)
+    if image.shape != gt_image.shape:
+        raise ValueError(
+            f"Image shape mismatch for SSIM: output={image.shape}, gt={gt_image.shape}"
+        )
+    return float(structural_similarity(image, gt_image, channel_axis=2, data_range=255))
+
+
+def compute_psnr(image: np.ndarray, gt_image: np.ndarray) -> float:
+    """Compute PSNR between two RGB images."""
+    from skimage.metrics import peak_signal_noise_ratio
+
+    image = _ensure_rgb_uint8_image(image)
+    gt_image = _ensure_rgb_uint8_image(gt_image)
+    if image.shape != gt_image.shape:
+        raise ValueError(
+            f"Image shape mismatch for PSNR: output={image.shape}, gt={gt_image.shape}"
+        )
+    return float(peak_signal_noise_ratio(gt_image, image, data_range=255))
+
+
+def compute_mean_abs_diff(image: np.ndarray, gt_image: np.ndarray) -> float:
+    """Compute mean absolute pixel difference between two RGB images."""
+    image = _ensure_rgb_uint8_image(image)
+    gt_image = _ensure_rgb_uint8_image(gt_image)
+    if image.shape != gt_image.shape:
+        raise ValueError(
+            f"Image shape mismatch for mean_abs_diff: output={image.shape}, gt={gt_image.shape}"
+        )
+    return float(np.abs(image.astype(np.float32) - gt_image.astype(np.float32)).mean())
+
+
 def output_format_to_ext(output_format: str | None) -> str:
     """Map output_format to file extension. Used by GT naming and consistency check."""
     if not output_format:
@@ -723,15 +856,33 @@ def _get_consistency_gt_dir() -> Path | None:
     return Path(d).resolve()
 
 
-def load_gt_embeddings(
+def _get_consistency_gt_cache_key(
+    case_id: str,
+    num_gpus: int,
+    is_video: bool,
+    output_format: str | None,
+) -> str:
+    gt_dir = _get_consistency_gt_dir()
+    source = str(gt_dir) if gt_dir is not None else "remote"
+    return f"{case_id}:{num_gpus}:{is_video}:{output_format or ''}:{source}"
+
+
+def load_consistency_gt(
     case_id: str,
     num_gpus: int,
     is_video: bool = False,
     output_format: str | None = None,
-) -> list[np.ndarray]:
-    """Load GT images and convert them into CLIP embeddings."""
+) -> LoadedConsistencyGT:
+    """Load GT images and CLIP embeddings for consistency checks."""
+    cache_key = _get_consistency_gt_cache_key(
+        case_id, num_gpus, is_video, output_format
+    )
+    cached = _consistency_gt_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
-    embeddings = []
+    images: list[np.ndarray] = []
 
     gt_dir = _get_consistency_gt_dir()
     if gt_dir is not None:
@@ -744,7 +895,7 @@ def load_gt_embeddings(
                 if not path.exists():
                     raise FileNotFoundError(f"GT image not found: {path}")
                 arr = np.array(Image.open(path).convert("RGB"))
-                embeddings.append(compute_clip_embedding(arr))
+                images.append(arr)
         else:
             path = None
             for fn in candidates:
@@ -756,23 +907,36 @@ def load_gt_embeddings(
                 raise FileNotFoundError(
                     f"GT image not found in {gt_dir}. Tried: {', '.join(candidates)}"
                 )
-            arr = np.array(Image.open(path).convert("RGB"))
-            embeddings.append(compute_clip_embedding(arr))
-        logger.info(
-            f"Loaded {len(embeddings)} GT embeddings for {case_id} from {gt_dir}"
-        )
+            images.append(np.array(Image.open(path).convert("RGB")))
+        logger.info(f"Loaded {len(images)} GT images for {case_id} from {gt_dir}")
     else:
         for fn in filenames:
             url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
             resp = requests.get(url, timeout=30)
             if resp.status_code != 200:
                 raise FileNotFoundError(f"GT image not found: {url}")
-            arr = np.array(Image.open(io.BytesIO(resp.content)).convert("RGB"))
-            embeddings.append(compute_clip_embedding(arr))
-        logger.info(
-            f"Loaded {len(embeddings)} GT embeddings for {case_id} from sgl-test-files"
-        )
-    return embeddings
+            images.append(np.array(Image.open(io.BytesIO(resp.content)).convert("RGB")))
+        logger.info(f"Loaded {len(images)} GT images for {case_id} from sglang-ci-data")
+
+    embeddings = [compute_clip_embedding(arr) for arr in images]
+    loaded_gt = LoadedConsistencyGT(images=images, embeddings=embeddings)
+    _consistency_gt_cache[cache_key] = loaded_gt
+    return loaded_gt
+
+
+def load_gt_embeddings(
+    case_id: str,
+    num_gpus: int,
+    is_video: bool = False,
+    output_format: str | None = None,
+) -> list[np.ndarray]:
+    """Load GT images and convert them into CLIP embeddings."""
+    return load_consistency_gt(
+        case_id=case_id,
+        num_gpus=num_gpus,
+        is_video=is_video,
+        output_format=output_format,
+    ).embeddings
 
 
 def gt_exists(
@@ -861,54 +1025,109 @@ def image_bytes_to_numpy(image_bytes: bytes) -> np.ndarray:
 
 def compare_with_gt(
     output_frames: list[np.ndarray],
-    gt_embeddings: list[np.ndarray],
-    threshold: float,
+    gt_data: LoadedConsistencyGT,
+    thresholds: ConsistencyThresholds,
     case_id: str,
 ) -> ConsistencyResult:
-    """Compare output frames with GT embeddings using CLIP similarity."""
-    if len(output_frames) != len(gt_embeddings):
+    """Compare output frames with GT using CLIP and pixel-level metrics."""
+    if len(output_frames) != len(gt_data.embeddings):
         raise ValueError(
-            f"Frame count mismatch: output={len(output_frames)}, gt={len(gt_embeddings)}"
+            f"Frame count mismatch: output={len(output_frames)}, gt={len(gt_data.embeddings)}"
         )
 
     similarity_scores = []
-    frame_details = []
+    frame_metrics: list[FrameConsistencyMetrics] = []
 
-    for i, (out_frame, gt_emb) in enumerate(zip(output_frames, gt_embeddings)):
+    for i, (out_frame, gt_frame, gt_emb) in enumerate(
+        zip(output_frames, gt_data.images, gt_data.embeddings)
+    ):
+        out_frame = _ensure_rgb_uint8_image(out_frame)
+        gt_frame = _ensure_rgb_uint8_image(gt_frame)
+        if out_frame.shape != gt_frame.shape:
+            raise ValueError(
+                f"Frame shape mismatch for case {case_id}, frame {i}: "
+                f"output={out_frame.shape}, gt={gt_frame.shape}"
+            )
         out_emb = compute_clip_embedding(out_frame)
-        similarity = compute_clip_similarity(out_emb, gt_emb)
-        similarity_scores.append(similarity)
-        frame_details.append(
-            {
-                "frame_index": i,
-                "similarity": similarity,
-                "passed": similarity >= threshold,
-                "output_shape": out_frame.shape,
-            }
+        clip_similarity = compute_clip_similarity(out_emb, gt_emb)
+        ssim = compute_ssim(out_frame, gt_frame)
+        psnr = compute_psnr(out_frame, gt_frame)
+        mean_abs_diff = compute_mean_abs_diff(out_frame, gt_frame)
+        similarity_scores.append(clip_similarity)
+        frame_metrics.append(
+            FrameConsistencyMetrics(
+                frame_index=i,
+                clip_similarity=clip_similarity,
+                ssim=ssim,
+                psnr=psnr,
+                mean_abs_diff=mean_abs_diff,
+                clip_passed=clip_similarity >= thresholds.clip_threshold,
+                ssim_passed=ssim >= thresholds.ssim_threshold,
+                psnr_passed=psnr >= thresholds.psnr_threshold,
+                mean_abs_diff_passed=(
+                    mean_abs_diff <= thresholds.mean_abs_diff_threshold
+                ),
+            )
         )
 
     min_similarity = min(similarity_scores)
-    passed = all(s >= threshold for s in similarity_scores)
+    min_ssim = min(metric.ssim for metric in frame_metrics)
+    min_psnr = min(metric.psnr for metric in frame_metrics)
+    max_mean_abs_diff = max(metric.mean_abs_diff for metric in frame_metrics)
+    passed = all(
+        metric.clip_passed
+        and metric.ssim_passed
+        and metric.psnr_passed
+        and metric.mean_abs_diff_passed
+        for metric in frame_metrics
+    )
 
     result = ConsistencyResult(
         case_id=case_id,
         passed=passed,
         similarity_scores=similarity_scores,
         min_similarity=min_similarity,
-        threshold=threshold,
-        frame_details=frame_details,
+        threshold=thresholds.clip_threshold,
+        min_ssim=min_ssim,
+        min_psnr=min_psnr,
+        max_mean_abs_diff=max_mean_abs_diff,
+        thresholds=thresholds,
+        frame_metrics=frame_metrics,
     )
 
     status = "PASSED" if passed else "FAILED"
     print(f"\n{'=' * 60}")
     print(f"[CLIP Consistency] {case_id}: {status}")
-    print(f"  Threshold: {threshold}")
+    print(
+        "  Thresholds: "
+        f"clip>={thresholds.clip_threshold}, "
+        f"ssim>={thresholds.ssim_threshold}, "
+        f"psnr>={thresholds.psnr_threshold}, "
+        f"mean_abs_diff<={thresholds.mean_abs_diff_threshold}"
+    )
     print(f"  Min similarity: {min_similarity:.4f}")
+    print(f"  Min SSIM: {min_ssim:.4f}")
+    print(f"  Min PSNR: {min_psnr:.4f}")
+    print(f"  Max mean_abs_diff: {max_mean_abs_diff:.4f}")
     print("  Frame details:")
-    for detail in frame_details:
-        frame_status = "PASS" if detail["passed"] else "FAIL"
+    for metric in frame_metrics:
+        frame_status = (
+            "PASS"
+            if (
+                metric.clip_passed
+                and metric.ssim_passed
+                and metric.psnr_passed
+                and metric.mean_abs_diff_passed
+            )
+            else "FAIL"
+        )
         print(
-            f"    Frame {detail['frame_index']}: similarity={detail['similarity']:.4f} {frame_status}"
+            f"    Frame {metric.frame_index}: "
+            f"clip={metric.clip_similarity:.4f} "
+            f"ssim={metric.ssim:.4f} "
+            f"psnr={metric.psnr:.4f} "
+            f"mean_abs_diff={metric.mean_abs_diff:.4f} "
+            f"{frame_status}"
         )
     print(f"{'=' * 60}\n")
 

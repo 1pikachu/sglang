@@ -38,12 +38,12 @@ from sglang.multimodal_gen.test.test_utils import (
     _get_consistency_gt_dir,
     compare_with_gt,
     extract_key_frames_from_video,
-    get_clip_threshold,
     get_consistency_gt_candidates,
+    get_consistency_thresholds,
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
-    load_gt_embeddings,
+    load_consistency_gt,
     wait_for_req_perf_record,
 )
 
@@ -490,15 +490,24 @@ For this case, expected file(s): {names}
 
 Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/consistency_gt/)
 
-(Optional) Per-case override in consistency_threshold.json: "cases": {{ "{case.id}": {{ "clip_threshold": 0.92 }} }}
+(Optional) Per-case override in consistency_threshold.json:
+  "cases": {{
+    "{case.id}": {{
+      "clip_threshold": 0.92,
+      "ssim_threshold": 0.95,
+      "psnr_threshold": 28.0,
+      "mean_abs_diff_threshold": 8.0
+    }}
+  }}
 """)
             pytest.fail(
                 f"GT not found for {case.id}. See logs for instructions to add GT."
             )
 
-        gt_embeddings = load_gt_embeddings(
+        gt_data = load_consistency_gt(
             case.id, num_gpus, is_video=is_video, output_format=output_format
         )
+        thresholds = get_consistency_thresholds(case.id, is_video=is_video)
 
         if is_video:
             output_frames = extract_key_frames_from_video(content)
@@ -507,26 +516,52 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
 
         result = compare_with_gt(
             output_frames=output_frames,
-            gt_embeddings=gt_embeddings,
-            threshold=get_clip_threshold(case),
+            gt_data=gt_data,
+            thresholds=thresholds,
             case_id=case.id,
         )
 
         if not result.passed:
-            failed_frames = [
-                f"  Frame {d['frame_index']}: similarity={d['similarity']:.4f}"
-                for d in result.frame_details
-                if not d["passed"]
-            ]
+            failed_frames = []
+            for metric in result.frame_metrics:
+                failed_metrics = []
+                if not metric.clip_passed:
+                    failed_metrics.append("clip")
+                if not metric.ssim_passed:
+                    failed_metrics.append("ssim")
+                if not metric.psnr_passed:
+                    failed_metrics.append("psnr")
+                if not metric.mean_abs_diff_passed:
+                    failed_metrics.append("mean_abs_diff")
+                if failed_metrics:
+                    failed_frames.append(
+                        "  Frame "
+                        f"{metric.frame_index}: "
+                        f"clip={metric.clip_similarity:.4f}, "
+                        f"ssim={metric.ssim:.4f}, "
+                        f"psnr={metric.psnr:.4f}, "
+                        f"mean_abs_diff={metric.mean_abs_diff:.4f}, "
+                        f"failed={', '.join(failed_metrics)}"
+                    )
             pytest.fail(
                 f"Consistency check failed for {case.id}:\n"
                 f"  Min similarity: {result.min_similarity:.4f}\n"
-                f"  Threshold: {result.threshold}\n"
+                f"  Min SSIM: {result.min_ssim:.4f}\n"
+                f"  Min PSNR: {result.min_psnr:.4f}\n"
+                f"  Max mean_abs_diff: {result.max_mean_abs_diff:.4f}\n"
+                f"  Thresholds: clip>={result.thresholds.clip_threshold}, "
+                f"ssim>={result.thresholds.ssim_threshold}, "
+                f"psnr>={result.thresholds.psnr_threshold}, "
+                f"mean_abs_diff<={result.thresholds.mean_abs_diff_threshold}\n"
                 f"  Failed frames:\n" + "\n".join(failed_frames)
             )
 
         logger.info(
-            f"[Consistency] {case.id}: PASSED (min_similarity={result.min_similarity:.4f})"
+            f"[Consistency] {case.id}: PASSED "
+            f"(min_similarity={result.min_similarity:.4f}, "
+            f"min_ssim={result.min_ssim:.4f}, "
+            f"min_psnr={result.min_psnr:.4f}, "
+            f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
         )
 
     def _save_gt_output(

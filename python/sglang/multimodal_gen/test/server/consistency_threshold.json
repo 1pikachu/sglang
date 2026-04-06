@@ -96,6 +96,12 @@
             "psnr_threshold": 9.5,
             "mean_abs_diff_threshold": 46.0
         },
+        "zimage_image_t2i_multi_lora": {
+            "clip_threshold": 0.90,
+            "ssim_threshold": 0.52,
+            "psnr_threshold": 9.5,
+            "mean_abs_diff_threshold": 46.0
+        },
         "fsdp-inference": {
             "clip_threshold": 0.92,
             "ssim_threshold": 0.90,
@@ -110,9 +116,9 @@
         },
         "flux_2_image_t2i_2_gpus": {
             "clip_threshold": 0.54,
-            "ssim_threshold": 0.33,
-            "psnr_threshold": 8.9,
-            "mean_abs_diff_threshold": 86.0
+            "ssim_threshold": 0.9,
+            "psnr_threshold": 19,
+            "mean_abs_diff_threshold": 8.0
         },
         "zimage_image_t2i_2_gpus": {
             "clip_threshold": 0.92,

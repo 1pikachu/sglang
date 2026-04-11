@@ -305,6 +305,7 @@ def get_jit_cuda_arch() -> ArchInfo:
     return _CUDA_ARCH
 
 
+@cache_once
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime():
         return False

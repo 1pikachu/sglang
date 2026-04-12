@@ -303,7 +303,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
                 # Generate delta
                 delta = text[offset:]
-                stream_offsets[index] = len(text)
+                stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 

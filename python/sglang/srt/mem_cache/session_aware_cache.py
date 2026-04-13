@@ -214,11 +214,16 @@ class SessionAwareCache(BasePrefixCache):
 
         # alloc_for_extend will write new KV indices into req_to_token[prefix_len:kv_allocated_len],
         # orphaning slot's tail indices. Free them here so accounting stays balanced.
-        if prefix_len < req.kv_allocated_len:
+        # Update slot state too — if the req gets rejected and restore_to_req is
+        # called again, slot.kv_allocated_len must reflect the freed tail to avoid
+        # a double free.
+        if prefix_len < slot.kv_allocated_len:
             tail_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, prefix_len : req.kv_allocated_len
+                slot.req_pool_idx, prefix_len : slot.kv_allocated_len
             ]
             self.token_to_kv_pool_allocator.free(tail_indices)
+            slot.kv_allocated_len = prefix_len
+            slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
             req.kv_allocated_len = prefix_len
             req.kv_committed_len = min(req.kv_committed_len, prefix_len)
 

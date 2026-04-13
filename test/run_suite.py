@@ -23,7 +23,10 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["stage-a-test-cpu"],
+    HWBackend.CPU: [
+        "stage-a-test-cpu",
+        "stage-b-test-cpu"
+    ],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",

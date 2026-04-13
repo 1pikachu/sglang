@@ -208,9 +208,6 @@ class SessionAwareCache(BasePrefixCache):
         # logits to sample the next token. We use token_ids length directly
         # (no additional -1) — the reservation has already been applied.
         prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
-        logger.info(
-            f"[DBG match_prefix] rid={req.rid[:8]} slot_committed={slot.kv_committed_len} slot_alloc={slot.kv_allocated_len} slot_protected={slot.cache_protected_len} token_ids_len={len(params.key.token_ids)} prefix_len={prefix_len} is_retracted={req.is_retracted}"
-        )
 
         # alloc_for_extend will write new KV indices into req_to_token[prefix_len:seq_len],
         # orphaning slot's tail indices in [prefix_len, slot.kv_allocated_len).
@@ -439,12 +436,9 @@ class SessionAwareCache(BasePrefixCache):
         A slot's pool_idx being in active_pool_idxs indicates a req owns it.
         """
         total = 0
-        for sid, slot in self.slots.items():
+        for slot in self.slots.values():
             in_batch = (
                 active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
-            )
-            logger.info(
-                f"[DBG slot] sid={sid[:8]} is_holding_kv={slot.is_holding_kv} is_active={slot.is_active} in_batch={in_batch} alloc={slot.kv_allocated_len} committed={slot.kv_committed_len} protected={slot.cache_protected_len} pool_idx={slot.req_pool_idx}"
             )
             if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)

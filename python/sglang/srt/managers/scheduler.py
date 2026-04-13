@@ -1411,10 +1411,22 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            _dbg_avail0 = (
+                self.token_to_kv_pool_allocator.available_size()
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+                else 0
+            )
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            _dbg_avail1 = (
+                self.token_to_kv_pool_allocator.available_size()
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+                else 0
+            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1429,6 +1441,12 @@ class Scheduler(
                 batch_result = None
                 self.cancel_bubble_timer()
 
+            _dbg_avail2 = (
+                self.token_to_kv_pool_allocator.available_size()
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+                else 0
+            )
+
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
@@ -1437,14 +1455,29 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
+            _dbg_avail3 = (
+                self.token_to_kv_pool_allocator.available_size()
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+                else 0
+            )
+
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
 
+            _dbg_avail4 = (
+                self.token_to_kv_pool_allocator.available_size()
+                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
+                else 0
+            )
+
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                logger.info(
+                    f"[DBG avail] start={_dbg_avail0} after_get_batch={_dbg_avail1} after_run={_dbg_avail2} after_process={_dbg_avail3} after_sample={_dbg_avail4} batch_size={len(batch.reqs) if batch else 0}"
+                )
                 self.self_check_during_busy()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:

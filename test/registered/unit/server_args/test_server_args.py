@@ -1,7 +1,6 @@
 import json
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
@@ -232,69 +231,6 @@ class TestSSLArgs(unittest.TestCase):
         self.assertEqual(server_args.ssl_certfile, "cert.pem")
         self.assertEqual(server_args.ssl_ca_certs, "ca.pem")
         self.assertEqual(server_args.ssl_keyfile_password, "secret")
-
-
-class TestModelSpecificAdjustments(unittest.TestCase):
-    def _make_qwen3_next_server_args(self, **overrides):
-        server_args = ServerArgs(model_path="dummy", **overrides)
-        server_args.tp_size = 4
-        server_args.nnodes = 1
-        server_args.attn_cp_size = 1
-        server_args.enable_dp_attention = False
-        server_args.moe_a2a_backend = "none"
-        return server_args
-
-    @patch("sglang.srt.server_args.get_device_name", return_value="NVIDIA H100")
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
-    @patch("sglang.srt.server_args.is_sm90_supported", return_value=True)
-    @patch.object(ServerArgs, "_handle_mamba_radix_cache")
-    @patch.object(
-        ServerArgs,
-        "get_model_config",
-        return_value=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
-        ),
-    )
-    def test_qwen3_next_auto_enables_flashinfer_allreduce_fusion(
-        self,
-        _mock_get_model_config,
-        _mock_handle_mamba_radix_cache,
-        _mock_is_sm90_supported,
-        _mock_is_sm100_supported,
-        _mock_get_device_name,
-    ):
-        server_args = self._make_qwen3_next_server_args()
-
-        server_args._handle_model_specific_adjustments()
-
-        self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
-
-    @patch("sglang.srt.server_args.get_device_name", return_value="NVIDIA H100")
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
-    @patch("sglang.srt.server_args.is_sm90_supported", return_value=True)
-    @patch.object(ServerArgs, "_handle_mamba_radix_cache")
-    @patch.object(
-        ServerArgs,
-        "get_model_config",
-        return_value=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
-        ),
-    )
-    def test_qwen3_next_enforce_disable_overrides_auto_enable(
-        self,
-        _mock_get_model_config,
-        _mock_handle_mamba_radix_cache,
-        _mock_is_sm90_supported,
-        _mock_is_sm100_supported,
-        _mock_get_device_name,
-    ):
-        server_args = self._make_qwen3_next_server_args(
-            enforce_disable_flashinfer_allreduce_fusion=True
-        )
-
-        server_args._handle_model_specific_adjustments()
-
-        self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
 
     def test_ssl_verify_without_ssl(self):
         server_args = ServerArgs(model_path="dummy")

@@ -168,6 +168,27 @@ def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     return True
 
 
+def handle_tag_run_cpu_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
+    """
+    Handles the /tag-run-cpu-ci-label command.
+    Returns True if action was taken, False otherwise.
+    """
+    if not user_perms.get("can_tag_run_ci_label", False):
+        print("Permission denied: can_tag_run_ci_label is false.")
+        return False
+
+    print("Permission granted. Adding 'run-cpu-ci' label.")
+    pr.add_to_labels("run-cpu-ci")
+
+    if react_on_success:
+        comment.create_reaction("+1")
+        print("CPU label added and comment reacted.")
+    else:
+        print("CPU label added (reaction suppressed).")
+
+    return True
+
+
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
@@ -827,6 +848,9 @@ def main():
     if first_line.startswith("/tag-run-ci-label"):
         handle_tag_run_ci(repo, pr, comment, user_perms)
 
+    elif first_line.startswith("/tag-run-cpu-ci-label"):
+        handle_tag_run_cpu_ci(repo, pr, comment, user_perms)
+
     elif first_line.startswith("/rerun-failed-ci"):
         handle_rerun_failed_ci(repo, pr, comment, user_perms)
 
@@ -853,6 +877,33 @@ def main():
             print("Combined command processed successfully; reaction added.")
         else:
             print("Combined command finished, but no actions were taken.")
+
+    elif first_line.startswith("/tag-cpu-and-rerun-ci"):
+        # Perform three actions, but suppress individual reactions:
+        # 1) tag run-ci (to satisfy pr-gate), 2) tag run-cpu-ci (for xeon gate), 3) rerun failed CI
+        print("Processing combined command: /tag-cpu-and-rerun-ci")
+
+        tagged_run_ci = handle_tag_run_ci(
+            repo, pr, comment, user_perms, react_on_success=False
+        )
+        tagged_run_cpu_ci = handle_tag_run_cpu_ci(
+            repo, pr, comment, user_perms, react_on_success=False
+        )
+
+        # Wait for labels to propagate before triggering rerun
+        if tagged_run_ci or tagged_run_cpu_ci:
+            print("Waiting 5 seconds for labels to propagate...")
+            time.sleep(5)
+
+        rerun = handle_rerun_failed_ci(
+            repo, pr, comment, user_perms, react_on_success=False
+        )
+
+        if tagged_run_ci or tagged_run_cpu_ci or rerun:
+            comment.create_reaction("+1")
+            print("Combined CPU command processed successfully; reaction added.")
+        else:
+            print("Combined CPU command finished, but no actions were taken.")
 
     elif first_line.startswith("/rerun-stage"):
         # Extract stage name from command

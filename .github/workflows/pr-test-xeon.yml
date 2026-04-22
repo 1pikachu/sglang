@@ -69,8 +69,27 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
+  cpu-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require run-cpu-ci label for PR
+        if: github.event_name == 'pull_request'
+        run: |
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'run-cpu-ci') }}" == "false" ]]; then
+            echo "Missing required label 'run-cpu-ci' for Xeon CI."
+            echo "Use /tag-run-cpu-ci-label or /tag-cpu-and-rerun-ci on the PR."
+            exit 1
+          fi
+
+      - name: Non-PR trigger skip label check
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Non-PR trigger (${{ github.event_name }}), skipping run-cpu-ci label gate."
+
   build-test:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, cpu-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: xeon-gnr
     env:
